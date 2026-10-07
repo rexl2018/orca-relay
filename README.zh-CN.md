@@ -67,7 +67,7 @@ Relay 为每个 `serverId` 保留一条 active server socket，并按 `clientId`
 
 `orca-relay-proxy` 运行在使用 Orca CLI 的远端机器上。它：
 
-- 监听本机 `/ws`。
+- 监听本机 `/ws` 和 `/`（根路径也兼容手机的地址编辑器）。
 - 接收 Orca CLI 的原始 WebSocket。
 - 作为 `role=client` 连接 VPS relay。
 - 把本地 WebSocket message 封装成 adapter frame。
@@ -85,6 +85,29 @@ Relay token 只能从 `ORCA_RELAY_TOKEN` 环境变量读取。
 - 如果无法连接本机 runtime，会向远端关闭连接，close code 为 `1013`，reason 为 `local runtime unavailable`。
 
 Relay token 只能从 `ORCA_RELAY_TOKEN` 环境变量读取。
+
+### 连接恢复
+
+Bridge 首次连接成功后，断线按 1、2、4、8、最多 15 秒的间隔重试。适配器每
+5 秒发送 relay Ping，15 秒没有收到匹配的 Pong 时重建连接。Rust relay 也每
+5 秒探测已注册 bridge；15 秒没有收到匹配的 Pong 时清理该 bridge 和其客户端。
+旧 bridge 即使不主动发送 Ping，也可通过标准 Pong 保持空闲连接。首次 bridge
+连接失败仍报错退出，需要进程监督器处理启动时的网络故障。被另一条 bridge
+明确替换后，旧 bridge 会停止，避免相互抢占。
+
+Relay 断开或更换 bridge 时关闭原有 client；客户端重连后建立新的 runtime
+连接。手机或 proxy 断开会清理对应 runtime socket，bridge 退出也会取消其
+runtime 任务。连接按 clientId 和 connectionId 一起隔离，proxy ID 包含进程
+实例后缀；relay frame 的 clientId 必须匹配已认证 socket。这是共享 token
+下的路由隔离，并非独立客户端授权。
+
+转发队列最多保存 8 条消息；队列满会关闭对应连接，避免阻塞其他客户端或丢弃
+字节后继续传输。连接建立和 socket 写入超时为 5 秒。relay/proxy 收到的消息
+上限为 16 MiB（relay 路径包括 adapter 元数据）。慢链路上的大消息可能超过固定
+写入期限；共享 bridge/relay 上行阻塞时会关闭该主机的会话及其所有客户端。
+大量同时输入输出也可能触发 runtime 队列满并关闭对应连接。这些有界背压策略
+不提供全局资源上限，也不保证延迟或大消息传输。公司 VPN、SSH 和 Mac 桌面 runtime
+的源码构建路径见[内网部署说明](docs/private-vpn-deployment.md)。
 
 ## Adapter 帧格式
 
@@ -327,7 +350,27 @@ orca-relay-proxy \
   --client-id "$ORCA_RELAY_CLIENT_ID"
 ```
 
-启动后使用它打印的本地 URL，通常是 `ws://127.0.0.1:17777/ws`，作为配对码的新 endpoint。
+使用已配置的本地入口，通常是 `ws://127.0.0.1:17777/ws`，作为配对码的新 endpoint。
+
+### 一个 proxy 接入多个 runtime
+
+一个 proxy 进程和监听端口可以服务多个 runtime。`ORCA_RELAY_SERVER_ID` 保持为默认目标，额外目标需要显式配置：
+
+```sh
+export ORCA_RELAY_SERVER_ID='<default-server-id>'
+export ORCA_RELAY_SERVER_IDS='<server-id-b>,<server-id-c>'
+orca-relay-proxy
+# 对应额外参数：--server-ids "$ORCA_RELAY_SERVER_IDS"
+```
+
+`/` 和 `/ws` 选择默认 runtime；同一端口的 `/r/<server-id>` 和 `/r/<server-id>/ws` 选择默认 ID 或显式配置的额外 ID。未知 ID 返回 HTTP 404，query 参数不能选择 runtime。仅额外的逗号分隔条目会去除两端空白，默认 ID 保持原值。空条目会被拒绝；没有额外目标时应省略 `ORCA_RELAY_SERVER_IDS`，不要设为空值。ID 放入单个路径段时需做 URL 编码，例如 ID `a?b` 对应 `/r/a%3Fb`，而不是 `/r/a?b`。
+命名路由的 ID 不能为 `.`、`..`，也不能包含路径分隔符或控制字符。无效的额外 ID 会阻止启动。旧配置中不满足这些条件的默认 ID 仍可通过 `/` 和 `/ws` 访问。
+
+每个 runtime 仍需运行自己的 bridge，注册对应 ID，并使用自己的 Orca 配对信息。仅把该配对信息的 endpoint 改为对应路径，其余字段（包括凭据和 scope）保持不变。ID 已配置但 bridge 离线时，客户端会因不可用而关闭连接。公网 TLS 反向代理必须完整保留路径。
+
+Proxy 监听端口自身没有认证，能够访问该端口的人可以尝试连接所有已配置目标；每个 Orca runtime 验证自己的配对凭据。监听地址应保持为 loopback 或私有 VPN 接口。共享 relay token 与路由 ID 不提供按 runtime 授权。
+
+库调用可使用 `adapter::run_proxy_with_server_ids(config, server_ids)`；原有 `ProxyConfig` 与 `run_proxy(config)` 保持兼容。
 
 ## 改写配对码 endpoint
 
@@ -353,6 +396,7 @@ orca-relay rewrite-pairing-code \
 
 - `ORCA_RELAY_TOKEN` 用于 relay WebSocket 访问控制。它只能来自环境变量或环境文件；二进制不接受 token CLI flag。
 - 任何拿到 `ORCA_RELAY_TOKEN` 的人都可以加入这个 relay 信任域。当前代码没有实现 per-client token、token 过期、token 哈希、mTLS、Origin 白名单、限流或按 `serverId` 授权。
+- Proxy 配置的路由 ID 用于选择目标，不增加按客户端或多租户授权；每个被选中的 Orca runtime 仍验证自己的配对凭据。
 - 公网 relay URL 应使用 `wss://`，由 Caddy/Nginx 等终止 TLS。
 - Relay origin 应保持 loopback 监听。
 - Payload 对 Orca Relay 不透明。这里的“不透明”不等于本项目提供加密。
@@ -425,7 +469,7 @@ bash scripts/restart-orca-relay-mobile.sh
 | Bridge 已连接但 CLI 没响应 | 本机 Orca runtime | 确认 bridge 主机能访问 `ORCA_RUNTIME_WS_URL`。 |
 | close code `1013`，reason `local runtime unavailable` | Bridge 到 runtime | 启动 Orca runtime 或修正 runtime URL。 |
 | 配对码改写失败 | Pairing payload | 输入必须是支持形态、版本 `2`，并包含 `endpoint`、`deviceToken`、`publicKeyB64`。 |
-| CLI 连错端口 | Proxy bind / pairing endpoint | 使用 `orca-relay-proxy` 打印的 `ws://.../ws`，或设置稳定 `--bind`。 |
+| CLI 连错端口 | Proxy bind / pairing endpoint | 设置明确、稳定的 `--bind`，并使用该地址。 |
 | Cloudflare 橙云模式行为变化 | Cloudflare edge path | 先用 DNS-only 灰云建立 baseline，再单独验证橙云 WebSocket/TLS。 |
 | `adapter text payload was not UTF-8` | Adapter opcode mismatch | 非 UTF-8 字节必须作为 WebSocket binary frame 发送，而不是 text frame。 |
 | Bridge 进程 + `:443 ESTAB` 看起来健康，但客户端卡住 | Soft-death / 会话卡死 | 跑 `scripts/orca-relay-soft-death-probe.sh --once --json`。高 Send-Q 且 `bytes_sent` 不涨、`lastrcv` 升高、或 bridge 没有 `:443` 是主要信号。 |
@@ -452,7 +496,7 @@ cargo build --release
 贡献者 release gate：
 
 ```sh
-cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/restart-orca-relay-mobile.sh
+cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
 ```
 
 这能证明：
@@ -483,8 +527,16 @@ orca-relay/
 ├── tests/
 │   ├── relay_contract.rs
 │   ├── adapter_contract.rs
-│   └── pairing_code.rs
+│   ├── pairing_code.rs
+│   ├── heartbeat_contract.rs
+│   ├── recovery_contract.rs
+│   ├── relay_lifecycle_contract.rs
+│   ├── relay_heartbeat_contract.rs
+│   └── multiplex_contract.rs
+├── docs/
+│   └── private-vpn-deployment.md
 ├── scripts/
+│   ├── launch-macos-bridge.py
 │   ├── install-vps.sh
 │   ├── orca-relay.env.example
 │   ├── orca-relay.service.template

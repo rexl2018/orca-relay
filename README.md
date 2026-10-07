@@ -67,7 +67,7 @@ The relay keeps one active server socket per `serverId` and routes client frames
 
 `orca-relay-proxy` runs on the remote machine where Orca CLI runs. It:
 
-- binds a local `/ws` endpoint;
+- binds local `/ws` and `/` endpoints (the root path also works with mobile address editors);
 - accepts the raw Orca CLI WebSocket;
 - opens a relay connection as `role=client`;
 - wraps each local WebSocket message into an adapter frame;
@@ -85,6 +85,36 @@ The relay token is read only from `ORCA_RELAY_TOKEN`.
 - closes the remote side with code `1013` and reason `local runtime unavailable` if it cannot reach the local runtime.
 
 The relay token is read only from `ORCA_RELAY_TOKEN`.
+
+### Connection recovery
+
+After its first successful connection, the bridge retries after 1, 2, 4, 8, then
+at most 15 seconds. The adapters send relay Ping every 5 seconds and retire an
+uplink after 15 seconds without its matching Pong. The Rust relay also Pings
+registered bridges every 5 seconds, removing a silent bridge and closing its
+clients after 15 seconds without a matching Pong. Standard Pong replies keep
+idle legacy bridges registered even when they do not initiate Pings. Initial bridge connection
+failure still exits with an error, so supervise startup failures. A bridge
+explicitly replaced by another bridge stops instead of competing to reconnect.
+
+Relay disconnect/replacement closes existing clients. Clients reconnect to create
+fresh runtime connections; phone/proxy disconnects retire their runtime sockets,
+and dropping the bridge cancels its runtime tasks. Connections use both client and
+connection IDs, and proxy IDs include a process-instance suffix. Relay frames must
+use the client ID of their authenticated socket. This routing isolation uses the
+shared token and does not provide separate client authorization.
+
+Forwarding queues hold at most 8 messages. A full client/runtime queue retires that
+connection instead of blocking unrelated clients or silently dropping its bytes.
+Socket writes and connection attempts have 5-second timeouts. Incoming relay/proxy
+messages are limited to 16 MiB, including adapter metadata on the relay path.
+Large frames over slow links can exceed the fixed write deadline. A stalled shared
+bridge/relay uplink retires its host session and all of that host's clients; a
+full runtime queue can also close its connection during simultaneous heavy input
+and output. These bounded-backpressure policies are not a global resource limit
+or a latency/large-transfer guarantee.
+See [private VPN deployment](docs/private-vpn-deployment.md) for a source-build path
+using an existing VPN and SSH with a Mac GUI runtime.
 
 ## Adapter frame format
 
@@ -327,7 +357,44 @@ orca-relay-proxy \
   --client-id "$ORCA_RELAY_CLIENT_ID"
 ```
 
-Use the printed local URL, normally `ws://127.0.0.1:17777/ws`, as the pairing-code endpoint.
+Use the configured local endpoint, normally `ws://127.0.0.1:17777/ws`, as the pairing-code endpoint.
+
+### One proxy for multiple runtimes
+
+One proxy process and listener can serve several runtimes. Keep
+`ORCA_RELAY_SERVER_ID` as the default, and explicitly configure additional IDs:
+
+```sh
+export ORCA_RELAY_SERVER_ID='<default-server-id>'
+export ORCA_RELAY_SERVER_IDS='<server-id-b>,<server-id-c>'
+orca-relay-proxy
+# Equivalent extra option: --server-ids "$ORCA_RELAY_SERVER_IDS"
+```
+
+`/` and `/ws` select the default runtime. `/r/<server-id>` and
+`/r/<server-id>/ws` select the default or an explicitly configured additional ID
+on the same port. Unknown IDs return HTTP 404; query parameters do not select a
+runtime. Only additional comma-separated entries are trimmed; the default ID is
+preserved. Blank entries are rejected, so omit `ORCA_RELAY_SERVER_IDS` when no
+extra targets are needed. URL-encode each ID as a single path segment: an ID
+`a?b` uses `/r/a%3Fb`, not `/r/a?b`.
+Named IDs cannot be `.` or `..`, or contain path separators or control characters.
+Invalid additional IDs prevent startup. Legacy defaults with such IDs remain available through `/` and `/ws`.
+
+Each runtime still needs its own bridge with a matching ID, and its own Orca
+pairing offer. Rewrite only that offer's endpoint to the corresponding named
+path; preserve all other fields, including credentials and scope. A configured
+ID whose bridge is offline closes the client as unavailable. Public TLS reverse
+proxies must preserve the full named path.
+
+The proxy listener has no authentication of its own. Anyone who can reach its
+port can attempt connections to all configured targets; each Orca runtime
+validates its own pairing credentials. Keep it on loopback or a private VPN
+interface. The shared relay token and configured IDs do not provide per-runtime
+authorization.
+
+Library callers can use `adapter::run_proxy_with_server_ids(config, server_ids)`;
+the existing `ProxyConfig` and `run_proxy(config)` remain compatible.
 
 ## Pairing-code rewrite
 
@@ -353,6 +420,7 @@ Do not paste real pairing codes, `deviceToken`, or `publicKeyB64` values into Gi
 
 - `ORCA_RELAY_TOKEN` gates relay WebSocket access. It is environment-only; no relay binary accepts token CLI flags.
 - Anyone with `ORCA_RELAY_TOKEN` can join the relay trust domain. The current code does not implement per-client tokens, token expiry, token hashing, mTLS, Origin allow-listing, rate limiting, or per-`serverId` authorization.
+- Configured proxy route IDs select destinations. They do not add per-client or multi-tenant authorization; each selected Orca runtime still validates its own pairing credentials.
 - Public relay traffic should use `wss://` through Caddy/Nginx or another TLS reverse proxy.
 - The relay origin should stay on loopback.
 - Payload bytes are opaque to Orca Relay. Opaque does not mean encrypted by this project.
@@ -452,7 +520,7 @@ For static Linux builds, this repository may also contain local `target/x86_64-u
 Contributor release gate:
 
 ```sh
-cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/restart-orca-relay-mobile.sh
+cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
 ```
 
 What this proves:
@@ -483,8 +551,16 @@ orca-relay/
 ├── tests/
 │   ├── relay_contract.rs
 │   ├── adapter_contract.rs
-│   └── pairing_code.rs
+│   ├── pairing_code.rs
+│   ├── heartbeat_contract.rs
+│   ├── recovery_contract.rs
+│   ├── relay_lifecycle_contract.rs
+│   ├── relay_heartbeat_contract.rs
+│   └── multiplex_contract.rs
+├── docs/
+│   └── private-vpn-deployment.md
 ├── scripts/
+│   ├── launch-macos-bridge.py
 │   ├── install-vps.sh
 │   ├── orca-relay.env.example
 │   ├── orca-relay.service.template
@@ -516,5 +592,7 @@ orca-relay/
 | `scripts/` | Deployment templates, one-command VPS installer, and operations helpers. |
 | `skills/deploy-orca-relay/SKILL.md` | Agent-executable deployment runbook for VPS operators, with or without their own domain. |
 | `skills/configure-orca-relay-clients/SKILL.md` | Agent runbook for development-host runtime + personal VPS + Win/Mac/Mobile pairing-code clients. |
-| `tests/` | Relay, adapter, and pairing-code contract tests. |
+| `tests/` | Relay, adapter, pairing, heartbeat, recovery, lifecycle and multiplex contract tests. |
+| `docs/private-vpn-deployment.md` | Source-built private VPN and additional-runtime runbook. |
+| `scripts/launch-macos-bridge.py` | Private JSON launcher for a supervised self-built Mac bridge. |
 | `assets/prompts/` | Public-safe image-generation prompts for README diagrams. |
