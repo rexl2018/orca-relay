@@ -243,17 +243,31 @@ curl --http1.1 -s -D- -o /dev/null --max-time 4 \
 You may reuse the same hostname for relay and public proxy only if reverse-proxy
 routing is intentional and tested. When unsure, use two hostnames.
 
-### B3. Same shared token and serverId
+### B3. Shared token and matching selected runtime ID
 
 | Process | Needs |
 | --- | --- |
 | `orca-relay` | `ORCA_RELAY_TOKEN` |
-| every `orca-relay-proxy` | same token + same `serverId` + unique `clientId` |
-| `orca-relay-bridge` | same token + same `serverId` + runtime URL |
+| every `orca-relay-proxy` | same token + default `serverId` + unique `clientId`; optional explicit extra IDs |
+| each `orca-relay-bridge` | same token + its own selected `serverId` + runtime URL |
+
+Optional one-proxy mode: set `ORCA_RELAY_SERVER_IDS='<server-id-b>,<server-id-c>'`
+or `--server-ids` alongside the existing default `ORCA_RELAY_SERVER_ID`.
+`/` and `/ws` keep the default target; `/r/<server-id>` and
+`/r/<server-id>/ws` select a default or explicit additional ID on the same port.
+Preserve these paths through the TLS reverse proxy and mobile pairing flow.
+Use each runtime's own pairing offer and rewrite only its endpoint to its named
+path, preserving every other field. Verify a real round trip for each target.
+Omit the extra-ID variable when unused; blank entries and additional IDs equal to `.` or `..`, or containing path separators or control characters prevent startup. URL-encode
+each ID as a single path segment. This config selects destinations; it does not
+add per-runtime authorization. The proxy port has no authentication of its own,
+so keep it on loopback or the intended VPN interface; each runtime validates its
+own Orca pairing credentials.
 
 Mismatch symptoms:
 
 - `401` → token mismatch
+- HTTP `404` on a named proxy route → ID not explicitly configured
 - `503` / server absent → bridge down or `serverId` mismatch
 
 ---

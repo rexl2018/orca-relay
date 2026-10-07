@@ -15,6 +15,10 @@
 - `src/bin/orca-relay-bridge.rs`: desktop/runtime-side bridge that can reach the real Orca runtime WebSocket.
 - `tests/relay_contract.rs`: relay auth, health, routing, and replacement socket behavior.
 - `tests/adapter_contract.rs`: adapter frame codec plus proxy/bridge forwarding behavior.
+- `tests/multiplex_contract.rs`: one proxy listener selecting explicitly configured runtimes, default-path compatibility, and routing isolation.
+- `tests/heartbeat_contract.rs`, `tests/recovery_contract.rs`, `tests/relay_lifecycle_contract.rs`, `tests/relay_heartbeat_contract.rs`: relay and adapter heartbeat deadlines, reconnect recovery, bounded queues and replacement cleanup.
+- `scripts/launch-macos-bridge.py`: owner-only JSON configuration launcher for a self-built Mac bridge.
+- `docs/private-vpn-deployment.md`: source-build private VPN, Mac supervision and additional-runtime runbook.
 - `tests/pairing_code.rs`: pairing-code input shapes and endpoint-only rewrite behavior.
 - `scripts/install-vps.sh`: systemd/Caddy VPS installer; token input is environment or token file only.
 - `scripts/orca-relay.env.example`, `scripts/orca-relay.service.template`, `scripts/Caddyfile.orca-relay.template`: deployment templates.
@@ -47,14 +51,14 @@ cargo test
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 python3 scripts/test_support_scripts.py
-python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py
+python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py
 bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
 ```
 
 Contributor release gate from the README:
 
 ```sh
-cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
+cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
 ```
 
 Health checks after deployment:
@@ -114,6 +118,14 @@ cargo run --bin orca-relay-proxy -- \
 ```
 
 Use the local proxy endpoint, normally `ws://127.0.0.1:17777/ws`, as the pairing-code endpoint.
+
+Optionally set `ORCA_RELAY_SERVER_IDS='<server-id-b>,<server-id-c>'` (or
+`--server-ids`) to allow extra runtime IDs on the same proxy listener. `/` and
+`/ws` keep the default `ORCA_RELAY_SERVER_ID`; `/r/<server-id>` and
+`/r/<server-id>/ws` select a configured ID. Unknown IDs return HTTP 404.
+Each runtime needs its own matching bridge and pairing offer; rewrite only that
+offer's endpoint, preserving credentials and scope. This routing configuration
+does not add per-runtime or multi-tenant authorization.
 
 ### Pairing-code endpoint rewrite
 

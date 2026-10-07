@@ -19,20 +19,21 @@ async fn main() -> Result<()> {
     let server_id = required(args.server_id, "ORCA_RELAY_SERVER_ID", "--server-id")?;
     let relay_token = env::var("ORCA_RELAY_TOKEN").context("missing ORCA_RELAY_TOKEN")?;
 
-    let _bridge = run_bridge(BridgeConfig {
+    let mut bridge = run_bridge(BridgeConfig {
         relay_url,
-        local_runtime_url: local_runtime_url.clone(),
+        local_runtime_url,
         server_id: server_id.clone(),
         relay_token,
     })
     .await?;
 
     println!("orca-relay-bridge connected for server_id={server_id}");
-    println!("forwarding relay traffic to local runtime {local_runtime_url}");
+    println!("forwarding relay traffic to the configured local runtime");
     println!("press Ctrl-C to stop");
-    signal::ctrl_c()
-        .await
-        .context("failed to wait for Ctrl-C")?;
+    tokio::select! {
+        result = signal::ctrl_c() => result.context("failed to wait for Ctrl-C")?,
+        result = bridge.wait() => result?,
+    }
     Ok(())
 }
 

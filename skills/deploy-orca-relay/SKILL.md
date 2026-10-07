@@ -185,6 +185,17 @@ orca-relay-proxy --bind '127.0.0.1:17777' \
   --relay-url "$ORCA_RELAY_URL" --server-id "$ORCA_RELAY_SERVER_ID" --client-id "$ORCA_RELAY_CLIENT_ID"
 ```
 
+Optional: one proxy can serve multiple runtimes on the same port. Keep the
+default `ORCA_RELAY_SERVER_ID`, and set
+`ORCA_RELAY_SERVER_IDS='<server-id-b>,<server-id-c>'` or `--server-ids`.
+`/` and `/ws` keep the default; `/r/<server-id>` and `/r/<server-id>/ws`
+select a configured target. Unknown IDs return HTTP 404 before upgrade.
+Omit the extra-ID variable when unused. Blank entries, IDs equal to `.` or `..`, and additional IDs containing path
+separators or control characters prevent startup. URL-encode IDs as single path segments.
+Each target needs its own matching bridge and its own pairing offer. Rewrite
+only that offer's endpoint to its named route; preserve all other fields.
+This selects destinations within the shared relay-token trust domain.
+
 Rewrite the pairing code so Orca CLI dials the local proxy instead of the
 original endpoint. Only the endpoint changes; every other pairing field is
 preserved:
@@ -199,6 +210,8 @@ link, or an Orca Desktop browser URL containing `#pairing=`.
 **Gate 3** — Orca CLI pairs through the rewritten code and completes one real
 round trip. Nothing before this proves an end-to-end session; process health and
 `/health` can both be green while the session is unusable.
+With multiple configured targets, verify a real round trip for each named route
+and confirm the mobile client preserves the endpoint's full path.
 
 ## Phase 4 — Stability layer on the runtime host
 

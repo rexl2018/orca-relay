@@ -1,4 +1,11 @@
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
@@ -15,9 +22,20 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, RwLock};
+use tokio::{
+    sync::{mpsc, Mutex, RwLock},
+    task::JoinHandle,
+};
 
-type Tx = mpsc::UnboundedSender<Message>;
+type Tx = mpsc::Sender<Message>;
+const QUEUE_CAPACITY: usize = 8;
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+const RELAY_CLIENT_DISCONNECTED: &str = "relay client disconnected";
+// Standard Ping/Pong, so bridges that never ping the relay stay registered while they answer.
+const HOST_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const HOST_HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const HOST_HEARTBEAT: &[u8] = b"orca-relay";
 
 #[derive(Clone)]
 struct AppState {
@@ -27,8 +45,59 @@ struct AppState {
 
 #[derive(Clone, Default)]
 struct Session {
-    server: Option<Tx>,
-    clients: HashMap<String, Tx>,
+    server: Option<Peer>,
+    clients: HashMap<String, ClientPeer>,
+}
+
+/// One relay socket: a bounded data queue plus a close slot that never waits behind data.
+#[derive(Clone)]
+struct Peer {
+    data: Tx,
+    control: Tx,
+    retired: Arc<AtomicBool>,
+}
+
+impl Peer {
+    fn new() -> (Self, mpsc::Receiver<Message>, mpsc::Receiver<Message>) {
+        let (data, data_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (control, control_rx) = mpsc::channel(1);
+        let peer = Self {
+            data,
+            control,
+            retired: Arc::new(AtomicBool::new(false)),
+        };
+        (peer, data_rx, control_rx)
+    }
+
+    fn same(&self, other: &Peer) -> bool {
+        self.data.same_channel(&other.data)
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// Shutdown state is published before the close is queued, so no later lookup forwards into it.
+    fn retire(&self, code: u16, reason: &'static str) {
+        if !self.retired.swap(true, Ordering::AcqRel) {
+            let _ = self.control.try_send(close_message(code, reason));
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ClientPeer {
+    client_id: String,
+    peer: Peer,
+    /// The host this socket was admitted to; lifecycle closes never reach a successor host.
+    server: Peer,
+    connections: Arc<Mutex<ClientConnections>>,
+}
+
+#[derive(Default)]
+struct ClientConnections {
+    open: HashSet<String>,
+    retired: bool,
 }
 
 pub fn rewrite_pairing_code(input: &str, local_endpoint: &str) -> Result<String> {
@@ -318,6 +387,9 @@ async fn ws_handler(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    let ws = ws
+        .max_message_size(MAX_MESSAGE_SIZE)
+        .max_frame_size(MAX_MESSAGE_SIZE);
     match params.role.as_str() {
         "server" => ws
             .on_upgrade(move |socket| handle_server(socket, state, params.server_id))
@@ -355,178 +427,429 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
 }
 
 async fn handle_server(socket: WebSocket, state: AppState, server_id: String) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let old_server = {
+    let (peer, data_rx, control_rx) = Peer::new();
+    {
         let mut sessions = state.sessions.write().await;
         let session = sessions.entry(server_id.clone()).or_default();
-        session.server.replace(tx.clone())
-    };
-    if let Some(old_server) = old_server {
-        let _ = old_server.send(Message::Close(Some(CloseFrame {
-            code: close_code::NORMAL,
-            reason: "server replaced".into(),
-        })));
+        // Retire under the lock: a predecessor that sees itself non-current is already closing.
+        if let Some(old_server) = session.server.replace(peer.clone()) {
+            old_server.retire(close_code::NORMAL, "server replaced");
+        }
+        for client in std::mem::take(&mut session.clients).into_values() {
+            client.peer.retire(close_code::AGAIN, "server replaced");
+        }
     }
-
-    let (mut writer, mut reader) = socket.split();
-    let writer_task = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            if writer.send(message).await.is_err() {
+    let (writer, mut reader) = socket.split();
+    let mut writer_task = spawn_writer(writer, data_rx, control_rx, true);
+    let mut writer_finished = false;
+    let mut close_reason = "server closed";
+    let mut liveness = tokio::time::interval(HOST_HEARTBEAT_INTERVAL);
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_pong = tokio::time::Instant::now();
+    loop {
+        let message = tokio::select! {
+            message = reader.next() => message,
+            _ = &mut writer_task => {
+                writer_finished = true;
                 break;
             }
-        }
-    });
-
-    while let Some(Ok(message)) = reader.next().await {
+            _ = liveness.tick() => {
+                // A silent host must not keep admitting clients whose frames it will never answer.
+                if last_pong.elapsed() >= HOST_HEARTBEAT_TIMEOUT {
+                    close_reason = "server heartbeat timed out";
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(Ok(message)) = message else { break };
+        // A retired host socket must never deliver replies into its successor's sessions.
+        let Some(client) = server_route(&state, &server_id, &peer, &message).await else {
+            break;
+        };
         match message {
             Message::Binary(frame) => {
-                if let Some(client_id) = frame_client_id(&frame) {
-                    let client = {
-                        let sessions = state.sessions.read().await;
-                        sessions
-                            .get(&server_id)
-                            .and_then(|session| session.clients.get(&client_id))
-                            .cloned()
-                    };
-                    if let Some(client) = client {
-                        let _ = client.send(Message::Binary(frame));
-                    }
+                if let Some(client) = client {
+                    forward_to_client(&state, &server_id, &client, frame).await;
                 }
+            }
+            Message::Ping(payload) => {
+                let _ = peer.data.try_send(Message::Pong(payload));
+            }
+            Message::Pong(payload) if payload == HOST_HEARTBEAT => {
+                last_pong = tokio::time::Instant::now();
             }
             Message::Close(_) => break,
             _ => {}
         }
     }
-
-    {
+    peer.retire(close_code::NORMAL, close_reason);
+    let clients = {
         let mut sessions = state.sessions.write().await;
-        if let Some(session) = sessions.get_mut(&server_id) {
-            if session
-                .server
-                .as_ref()
-                .map(|current| current.same_channel(&tx))
-                .unwrap_or(false)
-            {
-                session.server = None;
-            }
-            if session.server.is_none() && session.clients.is_empty() {
-                sessions.remove(&server_id);
-            }
+        let current = sessions
+            .get(&server_id)
+            .and_then(|session| session.server.as_ref())
+            .is_some_and(|server| server.same(&peer));
+        if current {
+            sessions
+                .remove(&server_id)
+                .map(|session| session.clients)
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        }
+    };
+    for client in clients.into_values() {
+        client.peer.retire(close_code::AGAIN, "server unavailable");
+    }
+    finish_writer(writer_task, writer_finished).await;
+}
+
+/// `None` when this host socket is no longer current; otherwise the live client a frame targets.
+async fn server_route(
+    state: &AppState,
+    server_id: &str,
+    peer: &Peer,
+    message: &Message,
+) -> Option<Option<ClientPeer>> {
+    let sessions = state.sessions.read().await;
+    let session = sessions
+        .get(server_id)
+        .filter(|session| session.server.as_ref().is_some_and(|s| s.same(peer)))?;
+    let Message::Binary(frame) = message else {
+        return Some(None);
+    };
+    Some(relay_header(frame).and_then(|header| session.clients.get(&header.client_id).cloned()))
+}
+
+/// Never waits on a client: a full or closed queue retires that client instead of dropping bytes mid-stream.
+async fn forward_to_client(state: &AppState, server_id: &str, client: &ClientPeer, frame: Vec<u8>) {
+    if client.peer.is_retired() {
+        return;
+    }
+    if client.peer.data.try_send(Message::Binary(frame)).is_err() {
+        retire_client(
+            state,
+            server_id,
+            client,
+            close_code::AGAIN,
+            "client queue overflow",
+        )
+        .await;
+    }
+}
+
+async fn retire_client(
+    state: &AppState,
+    server_id: &str,
+    client: &ClientPeer,
+    code: u16,
+    reason: &'static str,
+) {
+    client.peer.retire(code, reason);
+    let mut sessions = state.sessions.write().await;
+    if let Some(session) = sessions.get_mut(server_id) {
+        if session
+            .clients
+            .get(&client.client_id)
+            .is_some_and(|current| current.peer.same(&client.peer))
+        {
+            session.clients.remove(&client.client_id);
+        }
+        if session.server.is_none() && session.clients.is_empty() {
+            sessions.remove(server_id);
         }
     }
-    writer_task.abort();
+}
+
+type WsWriter = futures_util::stream::SplitSink<WebSocket, Message>;
+
+fn spawn_writer(
+    mut writer: WsWriter,
+    mut data: mpsc::Receiver<Message>,
+    mut control: mpsc::Receiver<Message>,
+    heartbeat: bool,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut heartbeat = heartbeat.then(|| {
+            let start = tokio::time::Instant::now() + HOST_HEARTBEAT_INTERVAL;
+            let mut interval = tokio::time::interval_at(start, HOST_HEARTBEAT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        });
+        loop {
+            // A pending close preempts queued data and any write stalled on a slow peer.
+            // Pings bypass the bounded data queue so a backlog cannot starve liveness probes.
+            let message = tokio::select! {
+                biased;
+                close = control.recv() => Err(close),
+                _ = next_heartbeat(&mut heartbeat) => Ok(Some(Message::Ping(HOST_HEARTBEAT.to_vec()))),
+                message = data.recv() => Ok(message),
+            };
+            let message = match message {
+                Ok(Some(message)) => message,
+                Ok(None) => return,
+                Err(close) => return send_close(&mut writer, close).await,
+            };
+            let close = tokio::select! {
+                biased;
+                close = control.recv() => Some(close),
+                sent = tokio::time::timeout(WRITE_TIMEOUT, writer.send(message)) => {
+                    if !matches!(sent, Ok(Ok(()))) {
+                        return;
+                    }
+                    None
+                }
+            };
+            if let Some(close) = close {
+                return send_close(&mut writer, close).await;
+            }
+        }
+    })
+}
+
+async fn next_heartbeat(heartbeat: &mut Option<tokio::time::Interval>) {
+    match heartbeat {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn send_close(writer: &mut WsWriter, close: Option<Message>) {
+    if let Some(close) = close {
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, writer.send(close)).await;
+    }
+}
+
+/// Gives a queued close a bounded chance to reach the peer before the socket is dropped.
+async fn finish_writer(mut writer_task: JoinHandle<()>, finished: bool) {
+    if !finished
+        && tokio::time::timeout(WRITE_TIMEOUT * 2, &mut writer_task)
+            .await
+            .is_err()
+    {
+        writer_task.abort();
+    }
+}
+
+fn close_message(code: u16, reason: &'static str) -> Message {
+    Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
 }
 
 async fn handle_client(socket: WebSocket, state: AppState, server_id: String, client_id: String) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    {
+    let (peer, data_rx, control_rx) = Peer::new();
+    let (client, old_client) = {
         let mut sessions = state.sessions.write().await;
         let Some(session) = sessions.get_mut(&server_id) else {
-            let _ = tx.send(Message::Close(Some(CloseFrame {
-                code: close_code::AGAIN,
-                reason: "server absent".into(),
-            })));
             return;
         };
-        if session.server.is_none() {
-            let _ = tx.send(Message::Close(Some(CloseFrame {
-                code: close_code::AGAIN,
-                reason: "server absent".into(),
-            })));
+        let Some(server) = session.server.clone() else {
             return;
+        };
+        let client = ClientPeer {
+            client_id: client_id.clone(),
+            peer: peer.clone(),
+            server,
+            connections: Arc::default(),
+        };
+        let old_client = session.clients.insert(client_id.clone(), client.clone());
+        if let Some(old_client) = &old_client {
+            old_client
+                .peer
+                .retire(close_code::NORMAL, "client replaced");
         }
-        if let Some(old_client) = session.clients.insert(client_id.clone(), tx.clone()) {
-            let _ = old_client.send(Message::Close(Some(CloseFrame {
-                code: close_code::NORMAL,
-                reason: "client replaced".into(),
-            })));
-        }
+        (client, old_client)
+    };
+    if let Some(old_client) = old_client {
+        // The successor's first frame must not overtake its predecessor's lifecycle close.
+        notify_client_gone(&old_client).await;
     }
-
-    let (mut writer, mut reader) = socket.split();
-    let writer_task = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            if writer.send(message).await.is_err() {
+    let (writer, mut reader) = socket.split();
+    let mut writer_task = spawn_writer(writer, data_rx, control_rx, false);
+    let mut writer_finished = false;
+    loop {
+        let message = tokio::select! {
+            message = reader.next() => message,
+            _ = &mut writer_task => {
+                writer_finished = true;
                 break;
             }
-        }
-    });
-
-    while let Some(Ok(message)) = reader.next().await {
+        };
+        let Some(Ok(message)) = message else { break };
         match message {
             Message::Binary(frame) => {
-                let server = {
-                    let sessions = state.sessions.read().await;
-                    sessions
-                        .get(&server_id)
-                        .and_then(|session| session.server.as_ref())
-                        .cloned()
+                // Routing metadata is bound to the authenticated socket, not trusted from the frame.
+                let Some(header) = relay_header(&frame) else {
+                    break;
                 };
-                if let Some(server) = server {
-                    let _ = server.send(Message::Binary(frame));
-                } else {
+                if header.client_id != client_id
+                    || !forward_to_server(&state, &server_id, &client, &header, frame).await
+                {
                     break;
                 }
+            }
+            Message::Ping(payload) => {
+                let _ = peer.data.try_send(Message::Pong(payload));
             }
             Message::Close(_) => break,
             _ => {}
         }
     }
-
-    {
-        let mut sessions = state.sessions.write().await;
-        if let Some(session) = sessions.get_mut(&server_id) {
-            if session
-                .clients
-                .get(&client_id)
-                .map(|current| current.same_channel(&tx))
-                .unwrap_or(false)
-            {
-                session.clients.remove(&client_id);
-            }
-            if session.server.is_none() && session.clients.is_empty() {
-                sessions.remove(&server_id);
-            }
-        }
-    }
-    writer_task.abort();
+    retire_client(
+        &state,
+        &server_id,
+        &client,
+        close_code::NORMAL,
+        "client closed",
+    )
+    .await;
+    notify_client_gone(&client).await;
+    finish_writer(writer_task, writer_finished).await;
 }
 
+async fn forward_to_server(
+    state: &AppState,
+    server_id: &str,
+    client: &ClientPeer,
+    header: &RelayHeader,
+    frame: Vec<u8>,
+) -> bool {
+    // Held across the send so this socket's lifecycle close is always ordered after its data.
+    let mut connections = client.connections.lock().await;
+    if connections.retired || client.peer.is_retired() {
+        return false;
+    }
+    let current = {
+        let sessions = state.sessions.read().await;
+        sessions.get(server_id).is_some_and(|session| {
+            session
+                .clients
+                .get(&client.client_id)
+                .is_some_and(|current| current.peer.same(&client.peer))
+                && session
+                    .server
+                    .as_ref()
+                    .is_some_and(|server| server.same(&client.server))
+        })
+    };
+    if !current {
+        return false;
+    }
+    if let Some(connection_id) = header.adapter_connection_id() {
+        if header.is_close() {
+            connections.open.remove(connection_id);
+        } else {
+            connections.open.insert(connection_id.to_owned());
+        }
+    }
+    let sent = tokio::time::timeout(
+        WRITE_TIMEOUT,
+        client.server.data.send(Message::Binary(frame)),
+    )
+    .await;
+    matches!(sent, Ok(Ok(())))
+}
+
+/// Closes the adapter connections a departed socket opened, once, on the host that admitted it.
+async fn notify_client_gone(client: &ClientPeer) {
+    let mut connections = client.connections.lock().await;
+    if std::mem::replace(&mut connections.retired, true) {
+        return;
+    }
+    let open = std::mem::take(&mut connections.open);
+    if client.server.is_retired() {
+        return;
+    }
+    for connection_id in open {
+        let Ok(frame) = lifecycle_close_frame(&client.client_id, &connection_id) else {
+            continue;
+        };
+        let sent = tokio::time::timeout(
+            WRITE_TIMEOUT,
+            client.server.data.send(Message::Binary(frame)),
+        )
+        .await;
+        if !matches!(sent, Ok(Ok(()))) {
+            break;
+        }
+    }
+}
+
+fn lifecycle_close_frame(client_id: &str, connection_id: &str) -> Result<Vec<u8>> {
+    let mut payload = close_code::AWAY.to_be_bytes().to_vec();
+    payload.extend_from_slice(RELAY_CLIENT_DISCONNECTED.as_bytes());
+    adapter::encode_adapter_frame(&adapter::AdapterFrame {
+        header: adapter::AdapterFrameHeader {
+            client_id: client_id.to_owned(),
+            connection_id: connection_id.to_owned(),
+            direction: adapter::AdapterDirection::ClientToServer,
+            opcode: adapter::AdapterOpcode::Close,
+            close_code: Some(close_code::AWAY),
+            close_reason: Some(RELAY_CLIENT_DISCONNECTED.to_owned()),
+        },
+        payload,
+    })
+}
+
+/// Routing metadata only; payload bytes stay opaque and legacy frames need just `clientId`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayHeader {
     client_id: String,
+    connection_id: Option<Value>,
+    direction: Option<Value>,
+    opcode: Option<Value>,
 }
 
-fn frame_client_id(frame: &[u8]) -> Option<String> {
+impl RelayHeader {
+    fn adapter_connection_id(&self) -> Option<&str> {
+        let to_server = self.direction.as_ref().and_then(Value::as_str) == Some("client_to_server");
+        self.connection_id
+            .as_ref()
+            .and_then(Value::as_str)
+            .filter(|_| to_server)
+    }
+
+    fn is_close(&self) -> bool {
+        self.opcode.as_ref().and_then(Value::as_str) == Some("close")
+    }
+}
+
+fn relay_header(frame: &[u8]) -> Option<RelayHeader> {
     let header_len = u32::from_be_bytes(frame.get(0..4)?.try_into().ok()?) as usize;
     let header_end = 4usize.checked_add(header_len)?;
-    let header = frame.get(4..header_end)?;
-    serde_json::from_slice::<RelayHeader>(header)
-        .ok()
-        .map(|header| header.client_id)
+    serde_json::from_slice(frame.get(4..header_end)?).ok()
 }
 
 pub mod adapter {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         fmt::Write as _,
         net::SocketAddr,
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc,
         },
+        time::Duration,
     };
 
     use anyhow::{anyhow, bail, Context, Result};
     use axum::{
         extract::{
+            rejection::PathRejection,
             ws::{
-                CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket, WebSocketUpgrade,
+                rejection::WebSocketUpgradeRejection, CloseFrame as AxumCloseFrame,
+                Message as AxumMessage, WebSocket, WebSocketUpgrade,
             },
-            State,
+            Path, State,
         },
-        response::IntoResponse,
+        http::StatusCode,
+        response::{IntoResponse, Response},
         routing::get,
         Router,
     };
@@ -546,6 +869,39 @@ pub mod adapter {
     };
 
     type RelayWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+    const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(15);
+    const HEARTBEAT: &[u8] = b"orca-relay";
+    const RETIRED_TTL: Duration = Duration::from_secs(60);
+    const MAX_RETIRED_CONNECTIONS: usize = 4096;
+
+    fn retire_connection(
+        retired: &mut HashMap<(String, String), tokio::time::Instant>,
+        key: (String, String),
+    ) {
+        if retired.len() >= MAX_RETIRED_CONNECTIONS {
+            if let Some(oldest) = retired
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone())
+            {
+                retired.remove(&oldest);
+            }
+        }
+        retired.insert(key, tokio::time::Instant::now());
+    }
+
+    struct RuntimeConnection {
+        tx: mpsc::Sender<TungsteniteMessage>,
+        task: JoinHandle<()>,
+    }
+    impl Drop for RuntimeConnection {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -616,7 +972,12 @@ pub mod adapter {
     }
 
     pub struct BridgeHandle {
-        task: JoinHandle<()>,
+        task: JoinHandle<Result<()>>,
+    }
+    impl BridgeHandle {
+        pub async fn wait(&mut self) -> Result<()> {
+            (&mut self.task).await.context("bridge task failed")?
+        }
     }
 
     impl Drop for BridgeHandle {
@@ -657,6 +1018,32 @@ pub mod adapter {
     }
 
     pub async fn run_proxy(config: ProxyConfig) -> Result<ProxyHandle> {
+        run_proxy_with_server_ids(config, Vec::new()).await
+    }
+
+    /// Runs the local proxy with `config.server_id` fixed as the target for `/` and `/ws`.
+    /// Each explicitly listed ID, plus the default when it is route-safe, may also be selected
+    /// per connection via `/r/:server_id` or `/r/:server_id/ws`; any other ID is rejected with
+    /// 404 before upgrade.
+    pub async fn run_proxy_with_server_ids(
+        config: ProxyConfig,
+        server_ids: Vec<String>,
+    ) -> Result<ProxyHandle> {
+        let mut allowed_server_ids = HashSet::with_capacity(server_ids.len() + 1);
+        for server_id in server_ids {
+            let server_id = server_id.trim();
+            if server_id.is_empty() {
+                bail!("additional server ids must not be blank");
+            }
+            if !route_safe_server_id(server_id) {
+                bail!("additional server ids must be usable as a single route segment");
+            }
+            allowed_server_ids.insert(server_id.to_string());
+        }
+        // The default stays opaque for `/` and `/ws`; it is only named-routable when route-safe.
+        if route_safe_server_id(&config.server_id) {
+            allowed_server_ids.insert(config.server_id.clone());
+        }
         install_tls_provider();
         let listener = TcpListener::bind(config.bind_addr)
             .await
@@ -669,10 +1056,21 @@ pub mod adapter {
             server_id: config.server_id,
             relay_token: config.relay_token,
             client_id: config.client_id,
+            instance_id: format!(
+                "{:x}-{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos(),
+                std::process::id()
+            ),
             next_connection_id: Arc::new(AtomicU64::new(1)),
+            allowed_server_ids: Arc::new(allowed_server_ids),
         };
         let app = Router::new()
+            .route("/", get(proxy_ws_handler))
             .route("/ws", get(proxy_ws_handler))
+            .route("/r/:server_id", get(proxy_routed_ws_handler))
+            .route("/r/:server_id/ws", get(proxy_routed_ws_handler))
             .with_state(state);
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -695,10 +1093,42 @@ pub mod adapter {
             .await
             .context("failed to connect bridge to relay")?;
         let task = tokio::spawn(async move {
-            let _ = bridge_loop(config, relay).await;
+            let mut relay = relay;
+            loop {
+                if matches!(
+                    bridge_loop(&config, relay).await,
+                    Ok(BridgeExit::Superseded)
+                ) {
+                    eprintln!("bridge superseded by another host connection; stopped");
+                    return Ok(());
+                }
+                eprintln!("bridge connection lost; reconnecting");
+                let mut delay = Duration::from_secs(1);
+                relay = loop {
+                    tokio::time::sleep(delay).await;
+                    match connect_with_bearer(&relay_url, &config.relay_token).await {
+                        Ok(relay) => {
+                            eprintln!("bridge reconnected");
+                            break relay;
+                        }
+                        Err(_) => {
+                            delay = (delay * 2).min(MAX_RETRY_DELAY);
+                        }
+                    }
+                };
+            }
         });
         tokio::task::yield_now().await;
         Ok(BridgeHandle { task })
+    }
+
+    fn route_safe_server_id(server_id: &str) -> bool {
+        !server_id.is_empty()
+            && server_id != "."
+            && server_id != ".."
+            && !server_id
+                .chars()
+                .any(|ch| ch == '/' || ch == '\\' || ch.is_control())
     }
 
     #[derive(Clone)]
@@ -707,229 +1137,330 @@ pub mod adapter {
         server_id: String,
         relay_token: String,
         client_id: String,
+        instance_id: String,
         next_connection_id: Arc<AtomicU64>,
+        allowed_server_ids: Arc<HashSet<String>>,
     }
 
     impl ProxyState {
         fn next_connection_id(&self) -> String {
             let id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
-            format!("{}-{id}", self.client_id)
+            format!("{}-{}-{id}", self.client_id, self.instance_id)
         }
     }
 
-    async fn proxy_ws_handler(
-        State(state): State<ProxyState>,
-        ws: WebSocketUpgrade,
-    ) -> impl IntoResponse {
-        ws.on_upgrade(move |socket| async move {
-            let _ = handle_proxy_ws(socket, state).await;
-        })
+    async fn proxy_ws_handler(State(state): State<ProxyState>, ws: WebSocketUpgrade) -> Response {
+        let server_id = state.server_id.clone();
+        upgrade_proxy_ws(ws, state, server_id)
     }
 
-    async fn handle_proxy_ws(socket: WebSocket, state: ProxyState) -> Result<()> {
+    // The selected ID is resolved per request and never written back into shared state.
+    async fn proxy_routed_ws_handler(
+        State(state): State<ProxyState>,
+        server_id: Result<Path<String>, PathRejection>,
+        ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    ) -> Response {
+        let Some(server_id) = server_id
+            .ok()
+            .map(|Path(server_id)| server_id)
+            .filter(|server_id| state.allowed_server_ids.contains(server_id))
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        match ws {
+            Ok(ws) => upgrade_proxy_ws(ws, state, server_id),
+            Err(rejection) => rejection.into_response(),
+        }
+    }
+
+    fn upgrade_proxy_ws(ws: WebSocketUpgrade, state: ProxyState, server_id: String) -> Response {
+        ws.max_message_size(super::MAX_MESSAGE_SIZE)
+            .max_frame_size(super::MAX_MESSAGE_SIZE)
+            .on_upgrade(move |socket| async move {
+                let _ = handle_proxy_ws(socket, state, server_id).await;
+            })
+    }
+
+    async fn handle_proxy_ws(
+        socket: WebSocket,
+        state: ProxyState,
+        server_id: String,
+    ) -> Result<()> {
         let connection_id = state.next_connection_id();
-        let relay_client_id = connection_id.clone();
+        let client_id = connection_id.clone();
         let relay_url = relay_url(
             &state.relay_url,
             &[
                 ("role", "client"),
-                ("serverId", &state.server_id),
-                ("clientId", &relay_client_id),
+                ("serverId", &server_id),
+                ("clientId", &client_id),
                 ("v", "1"),
             ],
         );
-        let relay = connect_with_bearer(&relay_url, &state.relay_token)
-            .await
-            .context("failed to connect proxy to relay")?;
-
+        let relay = match connect_with_bearer(&relay_url, &state.relay_token).await {
+            Ok(relay) => relay,
+            Err(_) => {
+                let mut socket = socket;
+                let _ = tokio::time::timeout(
+                    super::WRITE_TIMEOUT,
+                    socket.send(AxumMessage::Close(Some(AxumCloseFrame {
+                        code: 1013,
+                        reason: "relay unavailable".into(),
+                    }))),
+                )
+                .await;
+                return Ok(());
+            }
+        };
         let (mut local_tx, mut local_rx) = socket.split();
         let (mut relay_tx, mut relay_rx) = relay.split();
-
-        let client_id = relay_client_id;
-        let to_relay = async {
-            while let Some(message) = local_rx.next().await {
-                let message = message.context("failed to read local websocket message")?;
-                let Some((frame, closes_connection)) =
-                    adapter_frame_from_axum(message, &client_id, &connection_id)
-                else {
-                    continue;
-                };
-                relay_tx
-                    .send(TungsteniteMessage::Binary(encode_adapter_frame(&frame)?))
-                    .await
-                    .context("failed to write relay websocket message")?;
-                if closes_connection {
-                    break;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        };
-
-        let to_local = async {
-            while let Some(message) = relay_rx.next().await {
-                match message.context("failed to read relay websocket message")? {
-                    TungsteniteMessage::Binary(frame) => {
-                        let frame = decode_adapter_frame(&frame)?;
-                        if frame.header.connection_id != connection_id
-                            || frame.header.direction != AdapterDirection::ServerToClient
-                        {
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut last_pong = tokio::time::Instant::now();
+        let result: Result<()> = async {
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        if last_pong.elapsed() >= HEARTBEAT_TIMEOUT { bail!("proxy relay heartbeat timed out"); }
+                        tokio::time::timeout(super::WRITE_TIMEOUT, relay_tx.send(TungsteniteMessage::Ping(HEARTBEAT.to_vec()))).await??;
+                    }
+                    message = local_rx.next() => {
+                        let Some(message) = message else { break };
+                        let message = message.context("local websocket read failed")?;
+                        if let AxumMessage::Ping(payload) = message {
+                            tokio::time::timeout(super::WRITE_TIMEOUT, local_tx.send(AxumMessage::Pong(payload))).await??;
                             continue;
                         }
-                        let closes_connection = frame.header.opcode == AdapterOpcode::Close;
-                        local_tx
-                            .send(axum_message_from_adapter_frame(frame)?)
-                            .await
-                            .context("failed to write local websocket message")?;
-                        if closes_connection {
-                            break;
+                        if let Some((frame, closing)) = adapter_frame_from_axum(message, &client_id, &connection_id) {
+                            tokio::time::timeout(super::WRITE_TIMEOUT, relay_tx.send(TungsteniteMessage::Binary(encode_adapter_frame(&frame)?))).await??;
+                            if closing { break; }
                         }
                     }
-                    TungsteniteMessage::Close(_) => break,
-                    _ => {}
+                    message = relay_rx.next() => {
+                        let Some(message) = message else { break };
+                        match message.context("relay websocket read failed")? {
+                            TungsteniteMessage::Binary(bytes) => {
+                                let frame = decode_adapter_frame(&bytes)?;
+                                if frame.header.connection_id != connection_id || frame.header.direction != AdapterDirection::ServerToClient { continue; }
+                                let closing = frame.header.opcode == AdapterOpcode::Close;
+                                tokio::time::timeout(super::WRITE_TIMEOUT, local_tx.send(axum_message_from_adapter_frame(frame)?)).await??;
+                                if closing { break; }
+                            }
+                            TungsteniteMessage::Ping(payload) => {
+                                tokio::time::timeout(super::WRITE_TIMEOUT, relay_tx.send(TungsteniteMessage::Pong(payload))).await??;
+                            }
+                            TungsteniteMessage::Pong(payload) if payload == HEARTBEAT => { last_pong = tokio::time::Instant::now(); }
+                            TungsteniteMessage::Close(_) => break,
+                            _ => {}
+                        }
+                    }
                 }
             }
-            Ok::<(), anyhow::Error>(())
-        };
-
-        tokio::select! {
-            result = to_relay => result?,
-            result = to_local => result?,
+            Ok(())
+        }.await;
+        // Abrupt phone disconnects must retire the corresponding local runtime too.
+        let mut close = close_frame(&client_id, &connection_id, 1001, "client disconnected");
+        close.header.direction = AdapterDirection::ClientToServer;
+        if let Ok(bytes) = encode_adapter_frame(&close) {
+            let _ = tokio::time::timeout(
+                super::WRITE_TIMEOUT,
+                relay_tx.send(TungsteniteMessage::Binary(bytes)),
+            )
+            .await;
         }
-
-        Ok(())
+        let _ = tokio::time::timeout(
+            super::WRITE_TIMEOUT,
+            local_tx.send(AxumMessage::Close(None)),
+        )
+        .await;
+        let _ = tokio::time::timeout(super::WRITE_TIMEOUT, relay_tx.close()).await;
+        result
     }
 
-    async fn bridge_loop(config: BridgeConfig, relay: RelayWebSocket) -> Result<()> {
-        let (mut relay_writer, mut relay_reader) = relay.split();
-        let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<AdapterFrame>();
-        let relay_writer_task = tokio::spawn(async move {
-            while let Some(frame) = relay_rx.recv().await {
-                let Ok(encoded) = encode_adapter_frame(&frame) else {
-                    continue;
-                };
-                if relay_writer
-                    .send(TungsteniteMessage::Binary(encoded))
-                    .await
-                    .is_err()
-                {
-                    break;
+    enum BridgeExit {
+        Disconnected,
+        Superseded,
+    }
+
+    async fn bridge_loop(config: &BridgeConfig, relay: RelayWebSocket) -> Result<BridgeExit> {
+        let (mut writer, mut reader) = relay.split();
+        let (relay_tx, mut relay_rx) = mpsc::channel::<AdapterFrame>(super::QUEUE_CAPACITY);
+        let mut runtimes = HashMap::<(String, String), RuntimeConnection>::new();
+        let mut retired = HashMap::new();
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut last_pong = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if last_pong.elapsed() >= HEARTBEAT_TIMEOUT { bail!("relay heartbeat timed out"); }
+                    tokio::time::timeout(super::WRITE_TIMEOUT, writer.send(TungsteniteMessage::Ping(HEARTBEAT.to_vec()))).await??;
+                    let finished: Vec<_> = runtimes.iter().filter(|(_, runtime)| runtime.task.is_finished()).map(|(key, _)| key.clone()).collect();
+                    for key in finished {
+                        runtimes.remove(&key);
+                        // The task's terminal close is already queued after its replies.
+                        retire_connection(&mut retired, key);
+                    }
+                    retired.retain(|_, at| at.elapsed() < RETIRED_TTL);
                 }
-            }
-        });
-
-        let mut runtimes = HashMap::<String, mpsc::UnboundedSender<TungsteniteMessage>>::new();
-        while let Some(message) = relay_reader.next().await {
-            match message.context("failed to read bridge relay websocket message")? {
-                TungsteniteMessage::Binary(frame) => {
-                    let frame = decode_adapter_frame(&frame)?;
-                    if frame.header.direction != AdapterDirection::ClientToServer {
-                        continue;
-                    }
-
-                    if frame.header.opcode == AdapterOpcode::Close {
-                        if let Some(runtime) = runtimes.remove(&frame.header.connection_id) {
-                            let _ = runtime.send(tungstenite_close_message(&frame.header));
+                frame = relay_rx.recv() => {
+                    if let Some(frame) = frame {
+                        if frame.header.opcode == AdapterOpcode::Close {
+                            let key = (frame.header.client_id.clone(), frame.header.connection_id.clone());
+                            runtimes.remove(&key);
+                            retire_connection(&mut retired, key);
                         }
-                        continue;
+                        tokio::time::timeout(super::WRITE_TIMEOUT, writer.send(TungsteniteMessage::Binary(encode_adapter_frame(&frame)?))).await??;
                     }
-
-                    let runtime = if let Some(runtime) = runtimes.get(&frame.header.connection_id) {
-                        runtime.clone()
-                    } else {
-                        let runtime = match open_runtime_connection(
-                            &config.local_runtime_url,
-                            frame.header.client_id.clone(),
-                            frame.header.connection_id.clone(),
-                            relay_tx.clone(),
-                        )
-                        .await
-                        {
-                            Ok(runtime) => runtime,
-                            Err(_) => {
-                                let reason = "local runtime unavailable".to_string();
-                                let _ = relay_tx.send(AdapterFrame {
-                                    header: AdapterFrameHeader {
-                                        client_id: frame.header.client_id,
-                                        connection_id: frame.header.connection_id,
-                                        direction: AdapterDirection::ServerToClient,
-                                        opcode: AdapterOpcode::Close,
-                                        close_code: Some(1013),
-                                        close_reason: Some(reason.clone()),
-                                    },
-                                    payload: close_payload(1013, &reason),
-                                });
+                }
+                message = reader.next() => {
+                    let Some(message) = message else { return Ok(BridgeExit::Disconnected) };
+                    match message.context("bridge relay read failed")? {
+                        TungsteniteMessage::Binary(bytes) => {
+                            // Malformed adapter metadata must not take other clients offline.
+                            let Ok(frame) = decode_adapter_frame(&bytes) else { continue };
+                            if frame.header.direction != AdapterDirection::ClientToServer { continue; }
+                            let key = (frame.header.client_id.clone(), frame.header.connection_id.clone());
+                            if frame.header.opcode == AdapterOpcode::Close {
+                                if frame.header.close_reason.as_deref() == Some(super::RELAY_CLIENT_DISCONNECTED) {
+                                    runtimes.remove(&key);
+                                    retired.remove(&key);
+                                    continue;
+                                }
+                                retire_connection(&mut retired, key.clone());
+                                if let Some(runtime) = runtimes.get(&key) {
+                                    if !tungstenite_message_from_adapter_frame(frame).ok().is_some_and(|message| runtime.tx.try_send(message).is_ok()) {
+                                        runtimes.remove(&key);
+                                    }
+                                }
                                 continue;
                             }
-                        };
-                        runtimes.insert(frame.header.connection_id.clone(), runtime.clone());
-                        runtime
-                    };
-
-                    if runtime
-                        .send(tungstenite_message_from_adapter_frame(frame)?)
-                        .is_err()
-                    {
-                        runtimes.retain(|_, sender| !sender.is_closed());
+                            if retired.contains_key(&key) { continue; }
+                            let message = match tungstenite_message_from_adapter_frame(frame) {
+                                Ok(message) => message,
+                                Err(_) => {
+                                    runtimes.remove(&key);
+                                    retire_connection(&mut retired, key.clone());
+                                    let close = close_frame(&key.0, &key.1, 1007, "invalid adapter payload");
+                                    tokio::time::timeout(super::WRITE_TIMEOUT, writer.send(TungsteniteMessage::Binary(encode_adapter_frame(&close)?))).await??;
+                                    continue;
+                                }
+                            };
+                            if !runtimes.contains_key(&key) {
+                                let runtime = open_runtime_connection(&config.local_runtime_url, key.0.clone(), key.1.clone(), relay_tx.clone());
+                                runtimes.insert(key.clone(), runtime);
+                            }
+                            let runtime = &runtimes[&key];
+                            // Never wait for one runtime while its reply queue waits on this loop.
+                            if runtime.tx.try_send(message).is_err() {
+                                runtimes.remove(&key);
+                                retire_connection(&mut retired, key.clone());
+                                let close = close_frame(&key.0, &key.1, 1013, "runtime queue unavailable");
+                                tokio::time::timeout(super::WRITE_TIMEOUT, writer.send(TungsteniteMessage::Binary(encode_adapter_frame(&close)?))).await??;
+                            }
+                        }
+                        TungsteniteMessage::Ping(payload) => {
+                            tokio::time::timeout(super::WRITE_TIMEOUT, writer.send(TungsteniteMessage::Pong(payload))).await??;
+                        }
+                        TungsteniteMessage::Pong(payload) if payload == HEARTBEAT => { last_pong = tokio::time::Instant::now(); }
+                        // The Rust relay and Cloudflare Worker use different replacement reasons.
+                        TungsteniteMessage::Close(Some(close)) if close.reason == "server replaced" || close.reason == "bridge replaced" => { return Ok(BridgeExit::Superseded); }
+                        TungsteniteMessage::Close(_) => { return Ok(BridgeExit::Disconnected); }
+                        _ => {}
                     }
                 }
-                TungsteniteMessage::Close(_) => break,
-                _ => {}
             }
         }
-
-        relay_writer_task.abort();
-        Ok(())
     }
 
-    async fn open_runtime_connection(
+    fn close_frame(client_id: &str, connection_id: &str, code: u16, reason: &str) -> AdapterFrame {
+        AdapterFrame {
+            header: AdapterFrameHeader {
+                client_id: client_id.to_owned(),
+                connection_id: connection_id.to_owned(),
+                direction: AdapterDirection::ServerToClient,
+                opcode: AdapterOpcode::Close,
+                close_code: Some(code),
+                close_reason: Some(reason.to_owned()),
+            },
+            payload: close_payload(code, reason),
+        }
+    }
+
+    fn open_runtime_connection(
         local_runtime_url: &str,
         client_id: String,
         connection_id: String,
-        relay_tx: mpsc::UnboundedSender<AdapterFrame>,
-    ) -> Result<mpsc::UnboundedSender<TungsteniteMessage>> {
-        let (runtime, _) = connect_async(local_runtime_url)
+        relay_tx: mpsc::Sender<AdapterFrame>,
+    ) -> RuntimeConnection {
+        let local_runtime_url = local_runtime_url.to_owned();
+        let (tx, mut rx) = mpsc::channel::<TungsteniteMessage>(super::QUEUE_CAPACITY);
+        let task = tokio::spawn(async move {
+            // A stalled local handshake must not stop relay heartbeat or other clients.
+            let runtime = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                connect_async(&local_runtime_url),
+            )
             .await
-            .context("failed to connect local Orca runtime websocket")?;
-        let (mut runtime_writer, mut runtime_reader) = runtime.split();
-        let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel::<TungsteniteMessage>();
-
-        tokio::spawn(async move {
-            let write_runtime = async {
-                while let Some(message) = runtime_rx.recv().await {
-                    let closes_connection = matches!(message, TungsteniteMessage::Close(_));
-                    if runtime_writer.send(message).await.is_err() {
-                        break;
-                    }
-                    if closes_connection {
-                        break;
-                    }
-                }
-            };
-
-            let read_runtime = async {
-                while let Some(Ok(message)) = runtime_reader.next().await {
-                    let Some(frame) = adapter_frame_from_tungstenite(
-                        message,
+            {
+                Ok(Ok((runtime, _))) => runtime,
+                _ => {
+                    let close = close_frame(
                         &client_id,
                         &connection_id,
-                        AdapterDirection::ServerToClient,
-                    ) else {
-                        continue;
-                    };
-                    let closes_connection = frame.header.opcode == AdapterOpcode::Close;
-                    if relay_tx.send(frame).is_err() || closes_connection {
-                        break;
-                    }
+                        1013,
+                        "local runtime unavailable",
+                    );
+                    let _ = relay_tx.send(close).await;
+                    return;
                 }
             };
-
-            tokio::select! {
-                _ = write_runtime => {},
-                _ = read_runtime => {},
+            let (mut writer, mut reader) = runtime.split();
+            let mut forwarded_close = false;
+            let result: Result<()> = async {
+                loop {
+                    tokio::select! {
+                        message = rx.recv() => {
+                            let Some(message) = message else { break };
+                            let closing = matches!(message, TungsteniteMessage::Close(_));
+                            tokio::time::timeout(super::WRITE_TIMEOUT, writer.send(message)).await??;
+                            if closing { break; }
+                        }
+                        message = reader.next() => {
+                            let Some(message) = message else { break };
+                            let message = message?;
+                            if let TungsteniteMessage::Ping(payload) = message {
+                                tokio::time::timeout(super::WRITE_TIMEOUT, writer.send(TungsteniteMessage::Pong(payload))).await??;
+                                continue;
+                            }
+                            if let Some(frame) = adapter_frame_from_tungstenite(message, &client_id, &connection_id, AdapterDirection::ServerToClient) {
+                                let closing = frame.header.opcode == AdapterOpcode::Close;
+                                tokio::time::timeout(super::WRITE_TIMEOUT, relay_tx.send(frame)).await??;
+                                if closing { forwarded_close = true; return Ok(()); }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }.await;
+            if forwarded_close {
+                return;
             }
+            let (code, reason) = if result.is_ok() {
+                (1001, "runtime disconnected")
+            } else {
+                (1011, "runtime connection failed")
+            };
+            // This per-runtime task may wait for queue space. The bridge still drains
+            // replies; losing its uplink drops RuntimeConnection and aborts this task.
+            // Keeping the terminal close in the same FIFO avoids reply/close reordering.
+            let _ = relay_tx
+                .send(close_frame(&client_id, &connection_id, code, reason))
+                .await;
         });
-
-        Ok(runtime_tx)
+        RuntimeConnection { tx, task }
     }
 
     fn install_tls_provider() {
@@ -945,8 +1476,9 @@ pub mod adapter {
         let header_value = HeaderValue::from_str(&format!("Bearer {token}"))
             .context("invalid relay authorization header")?;
         request.headers_mut().insert(WS_AUTHORIZATION, header_value);
-        let (socket, _) = connect_async(request)
+        let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request))
             .await
+            .context("relay connection timed out")?
             .context("relay websocket connection failed")?;
         Ok(socket)
     }
@@ -1108,6 +1640,21 @@ pub mod adapter {
                 _ => {
                     let _ = write!(url, "%{byte:02X}");
                 }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::route_safe_server_id;
+
+        #[test]
+        fn route_safe_server_id_rejects_only_unrepresentable_segments() {
+            for id in ["", ".", "..", "a/b", "a\\b", "a\nb", "a\u{7f}b"] {
+                assert!(!route_safe_server_id(id));
+            }
+            for id in ["ws", "alpha", "two words", "\u{670d}\u{52a1}", "...", "%2F"] {
+                assert!(route_safe_server_id(id));
             }
         }
     }
