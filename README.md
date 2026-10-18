@@ -104,14 +104,19 @@ connection IDs, and proxy IDs include a process-instance suffix. Relay frames mu
 use the client ID of their authenticated socket. This routing isolation uses the
 shared token and does not provide separate client authorization.
 
-Forwarding queues hold at most 8 messages. A full client/runtime queue retires that
-connection instead of blocking unrelated clients or silently dropping its bytes.
+Relay forwarding queues hold at most 8 messages. The bridge's per-runtime ingress
+queue holds up to 256 messages, with a separate 64 MiB payload budget covering
+queued messages and the message currently being written. This accommodates short
+request bursts during tab recovery without expanding every relay queue. A full
+client/runtime queue or exhausted runtime payload budget retires that connection
+instead of blocking unrelated clients or silently dropping its bytes.
 Socket writes and connection attempts have 5-second timeouts. Incoming relay/proxy
 messages are limited to 16 MiB, including adapter metadata on the relay path.
 Large frames over slow links can exceed the fixed write deadline. A stalled shared
 bridge/relay uplink retires its host session and all of that host's clients; a
 full runtime queue can also close its connection during simultaneous heavy input
-and output. These bounded-backpressure policies are not a global resource limit
+and output. The runtime budget excludes other connections, decoded frames and
+socket/encoding buffers. These bounded-backpressure policies are not a global resource limit
 or a latency/large-transfer guarantee.
 See [private VPN deployment](docs/private-vpn-deployment.md) for a source-build path
 using an existing VPN and SSH with a Mac GUI runtime.
@@ -445,6 +450,7 @@ Support scripts:
 | `scripts/test_support_scripts.py` | Local checks for frame construction, token redaction, and helper script safety. |
 | `scripts/orca-relay-soft-death-probe.sh` | Evidence-only soft-death probe. Samples TCP Send-Q / bytes / lastrcv and freezes local+remote snapshots on warn/crit. Never restarts services. |
 | `scripts/orca-relay-bridge-watchdog.sh` | Local connectivity watchdog. Restarts the headless `orca serve` runtime and/or the bridge when the path is dead or soft-wedged. Does **not** bounce remote/public proxies. |
+| `scripts/orca-relay-macos-bridge-watchdog.py` | Conservative periodic recovery for a stopped Mac LaunchAgent bridge after confirmed relay absence. See [Mac supervision and limits](docs/private-vpn-deployment.md#recover-a-stopped-mac-bridge). |
 | `scripts/orca-relay-watchdog-daemon.sh` | Detached singleton supervisor for the watchdog loop. Uses `setsid` plus an `flock` lock so the loop survives terminal/tmux/SSH exit and cannot double-start. |
 | `scripts/restart-orca-relay-mobile.sh` | Full operator restart: remote relay/proxy units + local Xvfb/Electron serve + pairing-code refresh + public health/WS checks. |
 
@@ -520,7 +526,7 @@ For static Linux builds, this repository may also contain local `target/x86_64-u
 Contributor release gate:
 
 ```sh
-cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
+cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m unittest discover -s tests -p 'test_macos_bridge_watchdog.py' && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py scripts/orca-relay-macos-bridge-watchdog.py && (for script in scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh; do bash -n "$script" || exit; done)
 ```
 
 What this proves:
@@ -561,6 +567,7 @@ orca-relay/
 │   └── private-vpn-deployment.md
 ├── scripts/
 │   ├── launch-macos-bridge.py
+│   ├── orca-relay-macos-bridge-watchdog.py
 │   ├── install-vps.sh
 │   ├── orca-relay.env.example
 │   ├── orca-relay.service.template

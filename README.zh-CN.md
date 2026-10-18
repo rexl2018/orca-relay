@@ -101,11 +101,15 @@ runtime 任务。连接按 clientId 和 connectionId 一起隔离，proxy ID 包
 实例后缀；relay frame 的 clientId 必须匹配已认证 socket。这是共享 token
 下的路由隔离，并非独立客户端授权。
 
-转发队列最多保存 8 条消息；队列满会关闭对应连接，避免阻塞其他客户端或丢弃
-字节后继续传输。连接建立和 socket 写入超时为 5 秒。relay/proxy 收到的消息
+Relay 转发队列最多保存 8 条消息。bridge 的每个 runtime 入口队列最多保存
+256 条消息，并对排队中及正在写入的 payload 合计设置 64 MiB 预算，用来容纳
+恢复 tab 时的短暂请求突发；其他 relay 队列容量保持不变。队列满或该字节预算
+耗尽会关闭对应连接，避免阻塞其他客户端或丢弃字节后继续传输。
+连接建立和 socket 写入超时为 5 秒。relay/proxy 收到的消息
 上限为 16 MiB（relay 路径包括 adapter 元数据）。慢链路上的大消息可能超过固定
 写入期限；共享 bridge/relay 上行阻塞时会关闭该主机的会话及其所有客户端。
-大量同时输入输出也可能触发 runtime 队列满并关闭对应连接。这些有界背压策略
+大量同时输入输出也可能触发 runtime 队列满并关闭对应连接。该预算不包括其他
+连接、解码中的 frame 及 socket/编码缓冲。这些有界背压策略
 不提供全局资源上限，也不保证延迟或大消息传输。公司 VPN、SSH 和 Mac 桌面 runtime
 的源码构建路径见[内网部署说明](docs/private-vpn-deployment.md)。
 
@@ -421,6 +425,7 @@ curl -fsS 'http://127.0.0.1:8080/health'
 | `scripts/test_support_scripts.py` | 本地检查 frame 构造、token redaction、脚本安全默认值。 |
 | `scripts/orca-relay-soft-death-probe.sh` | 仅取证的 soft-death 探活。采样 TCP Send-Q / bytes / lastrcv，在 warn/crit 时冻结本地+远端快照；**不重启**任何服务。 |
 | `scripts/orca-relay-bridge-watchdog.sh` | 本地连通性 watchdog。在路径死亡或 soft-wedge 时重启 headless `orca serve` runtime 和/或 bridge；**不**重启远端/公网 proxy。 |
+| `scripts/orca-relay-macos-bridge-watchdog.py` | 定期检查已停止的 Mac LaunchAgent bridge，仅在连续确认 relay 无对应连接后恢复。见 [Mac 监管及边界](docs/private-vpn-deployment.md#recover-a-stopped-mac-bridge)。 |
 | `scripts/orca-relay-watchdog-daemon.sh` | watchdog 循环的脱离终端单实例守护器。用 `setsid` 加 `flock` 锁，保证退出终端/tmux/SSH 后仍存活，且不会重复启动。 |
 | `scripts/restart-orca-relay-mobile.sh` | 运维一键全量重启：远端 relay/proxy 单元 + 本地 Xvfb/Electron serve + pairing-code 刷新 + 公网健康/WS 检查。 |
 
@@ -496,7 +501,7 @@ cargo build --release
 贡献者 release gate：
 
 ```sh
-cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
+cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m unittest discover -s tests -p 'test_macos_bridge_watchdog.py' && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py scripts/orca-relay-macos-bridge-watchdog.py && (for script in scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh; do bash -n "$script" || exit; done)
 ```
 
 这能证明：
@@ -537,6 +542,7 @@ orca-relay/
 │   └── private-vpn-deployment.md
 ├── scripts/
 │   ├── launch-macos-bridge.py
+│   ├── orca-relay-macos-bridge-watchdog.py
 │   ├── install-vps.sh
 │   ├── orca-relay.env.example
 │   ├── orca-relay.service.template

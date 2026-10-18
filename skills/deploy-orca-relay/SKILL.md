@@ -215,6 +215,11 @@ and confirm the mobile client preserves the endpoint's full path.
 
 ## Phase 4 — Stability layer on the runtime host
 
+The shell scripts below require a Linux headless runtime. For Mac GUI bridge
+supervision, use the separate LaunchAgent approach in
+[private VPN deployment](../../docs/private-vpn-deployment.md#recover-a-stopped-mac-bridge),
+including its conservative recovery conditions and ownership race limits.
+
 This is what keeps an unattended deployment alive. Install it once Gate 3 passes.
 
 ```sh

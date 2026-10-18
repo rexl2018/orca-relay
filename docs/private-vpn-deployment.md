@@ -76,6 +76,59 @@ If login startup is required, use a separate `RunAtLoad` LaunchAgent that invoke
 the system `open -g -a <existing-Orca-app-path>`. Do not give this one-shot opener
 continuous `KeepAlive`; opening an already-running app must preserve its process.
 
+### Recover a stopped Mac bridge
+
+An additional periodic user LaunchAgent can run the reviewed
+`scripts/orca-relay-macos-bridge-watchdog.py` with the system Python 3.9 or newer.
+Keep the bridge's `SuccessfulExit=false` policy: unconditional restart after
+`server replaced` can make two bridge owners repeatedly replace each other.
+The watchdog is a single check, intended for `RunAtLoad=true` and
+`StartInterval=10`, with no continuous `KeepAlive` of its own. Use absolute
+paths for its program and arguments:
+
+```text
+/usr/bin/python3
+<absolute-installed-watchdog-path>
+--config <absolute-private-bridge-json-path>
+--label <existing-bridge-launchagent-label>
+--state-dir <absolute-private-watchdog-state-directory>
+--quiet-running
+```
+
+The original bridge LaunchAgent must already be loaded in the current user's
+GUI domain. A running bridge is left alone. For a conclusively stopped bridge,
+the watchdog makes an authenticated client WebSocket handshake against the
+configured relay, without sending adapter frames or opening a runtime session.
+Only consecutive HTTP 503 responses count as an absent bridge; a valid 101
+means a bridge is registered, while authentication failures, network errors and
+ambiguous launchd states reset the evidence. The default is three observations,
+followed by one fresh confirmation and another local process check before a
+non-killing `launchctl kickstart` of the original bridge. Samples more than
+60 seconds apart, clock reversal and configuration changes reset the count.
+Launchd's own `ThrottleInterval` can delay a requested start. A bounded kickstart
+failure is recorded and resets the streak for a later retry; use a short bridge
+startup throttle, such as 10 seconds, with this sampling schedule.
+
+Use this only against the direct relay or the existing SSH local forward.
+A proxy-generated HTTP 503 cannot establish that the relay has no bridge.
+Registration checks also cannot prove the existing bridge is responsive. There
+is no atomic reservation between the final probe and bridge registration: a new
+owner arriving in that interval could still be replaced. This watchdog reduces
+unattended downtime after an abandoned replacement; it does not resolve the
+source of competing owners or restart a running but unresponsive bridge.
+
+The state directory is owner-only, with a process lock and private state files.
+Diagnostics contain fixed event names and counters, without URLs or credentials.
+`--quiet-running` suppresses routine healthy ticks. Use private log files and
+avoid indefinite log accumulation. To roll back,
+unload only the added watchdog LaunchAgent; leave the existing bridge, tunnel,
+runtime and pairing identity intact. Verify the isolated behavior before install:
+
+```sh
+/usr/bin/python3 -m unittest discover -s tests -p 'test_macos_bridge_watchdog.py'
+/usr/bin/python3 -m py_compile scripts/orca-relay-macos-bridge-watchdog.py
+```
+
 ## Add another runtime
 
 Give each additional host its own routing ID, bridge and native Orca mobile
