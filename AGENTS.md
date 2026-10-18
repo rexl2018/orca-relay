@@ -17,7 +17,9 @@
 - `tests/adapter_contract.rs`: adapter frame codec plus proxy/bridge forwarding behavior.
 - `tests/multiplex_contract.rs`: one proxy listener selecting explicitly configured runtimes, default-path compatibility, and routing isolation.
 - `tests/heartbeat_contract.rs`, `tests/recovery_contract.rs`, `tests/relay_lifecycle_contract.rs`, `tests/relay_heartbeat_contract.rs`: relay and adapter heartbeat deadlines, reconnect recovery, bounded queues and replacement cleanup.
+- `tests/runtime_burst_contract.rs`: deterministic delayed-handshake burst forwarding and per-runtime ingress isolation; runtime ingress has separate message and queued/in-flight payload limits.
 - `scripts/launch-macos-bridge.py`: owner-only JSON configuration launcher for a self-built Mac bridge.
+- `scripts/orca-relay-macos-bridge-watchdog.py`: periodic Mac LaunchAgent check; only recovers a stopped bridge after consecutive direct-relay absence responses. Does not restart a running bridge; see the private VPN runbook for ownership race limits.
 - `docs/private-vpn-deployment.md`: source-build private VPN, Mac supervision and additional-runtime runbook.
 - `tests/pairing_code.rs`: pairing-code input shapes and endpoint-only rewrite behavior.
 - `scripts/install-vps.sh`: systemd/Caddy VPS installer; token input is environment or token file only.
@@ -51,14 +53,15 @@ cargo test
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 python3 scripts/test_support_scripts.py
-python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py
-bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
+python3 -m unittest discover -s tests -p 'test_macos_bridge_watchdog.py'
+python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py scripts/orca-relay-macos-bridge-watchdog.py
+(for script in scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh; do bash -n "$script" || exit; done)
 ```
 
 Contributor release gate from the README:
 
 ```sh
-cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py && bash -n scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh
+cargo test && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && python3 scripts/test_support_scripts.py && python3 -m unittest discover -s tests -p 'test_macos_bridge_watchdog.py' && python3 -m py_compile scripts/measure-relay-ws-latency.py scripts/test_support_scripts.py scripts/launch-macos-bridge.py scripts/orca-relay-macos-bridge-watchdog.py && (for script in scripts/cloudflare-relay-mode.sh scripts/compare-cloudflare-relay-latency.sh scripts/install-vps.sh scripts/orca-relay-bridge-watchdog.sh scripts/orca-relay-soft-death-probe.sh scripts/orca-relay-watchdog-daemon.sh scripts/restart-orca-relay-mobile.sh; do bash -n "$script" || exit; done)
 ```
 
 Health checks after deployment:

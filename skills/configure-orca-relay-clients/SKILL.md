@@ -164,6 +164,11 @@ Close code `1013` / `local runtime unavailable` means bridge→runtime failed: f
 
 ### A3. Optional local stability layer
 
+The shell watchdog below is for Linux headless runtimes. For a Mac GUI runtime,
+use separate LaunchAgents and the conservative stopped-bridge check described in
+[private VPN deployment](../../docs/private-vpn-deployment.md#recover-a-stopped-mac-bridge).
+It does not restart a running bridge or the GUI runtime.
+
 Only after a client has paired once:
 
 ```sh

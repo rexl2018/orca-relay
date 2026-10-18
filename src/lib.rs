@@ -856,7 +856,11 @@ pub mod adapter {
     use futures_util::{SinkExt, StreamExt};
     use rustls::crypto::{ring, CryptoProvider};
     use serde::{Deserialize, Serialize};
-    use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, OwnedSemaphorePermit, Semaphore},
+        task::JoinHandle,
+    };
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{
@@ -876,6 +880,10 @@ pub mod adapter {
     const HEARTBEAT: &[u8] = b"orca-relay";
     const RETIRED_TTL: Duration = Duration::from_secs(60);
     const MAX_RETIRED_CONNECTIONS: usize = 4096;
+    // A new runtime cannot drain ingress until its WebSocket handshake completes.
+    // Permit normal restore/subscription bursts without enlarging relay queues.
+    const RUNTIME_QUEUE_CAPACITY: usize = 256;
+    const RUNTIME_QUEUE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
     fn retire_connection(
         retired: &mut HashMap<(String, String), tokio::time::Instant>,
@@ -893,8 +901,63 @@ pub mod adapter {
         retired.insert(key, tokio::time::Instant::now());
     }
 
+    struct QueuedRuntimeMessage {
+        message: TungsteniteMessage,
+        // Held through the socket write, not just until dequeue. Drop and task
+        // cancellation also release the budget for queued or in-flight messages.
+        _byte_permit: OwnedSemaphorePermit,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum RuntimeSendError {
+        Full,
+        Closed,
+    }
+
+    struct RuntimeSender {
+        tx: mpsc::Sender<QueuedRuntimeMessage>,
+        bytes: Arc<Semaphore>,
+    }
+
+    impl RuntimeSender {
+        fn try_send(&self, message: TungsteniteMessage) -> Result<(), RuntimeSendError> {
+            if self.tx.is_closed() {
+                return Err(RuntimeSendError::Closed);
+            }
+            let len = u32::try_from(message.len().max(1)).map_err(|_| RuntimeSendError::Full)?;
+            let byte_permit = self
+                .bytes
+                .clone()
+                .try_acquire_many_owned(len)
+                .map_err(|_| RuntimeSendError::Full)?;
+            self.tx
+                .try_send(QueuedRuntimeMessage {
+                    message,
+                    _byte_permit: byte_permit,
+                })
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => RuntimeSendError::Full,
+                    mpsc::error::TrySendError::Closed(_) => RuntimeSendError::Closed,
+                })
+        }
+    }
+
+    fn runtime_channel(
+        capacity: usize,
+        byte_budget: usize,
+    ) -> (RuntimeSender, mpsc::Receiver<QueuedRuntimeMessage>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            RuntimeSender {
+                tx,
+                bytes: Arc::new(Semaphore::new(byte_budget)),
+            },
+            rx,
+        )
+    }
+
     struct RuntimeConnection {
-        tx: mpsc::Sender<TungsteniteMessage>,
+        tx: RuntimeSender,
         task: JoinHandle<()>,
     }
     impl Drop for RuntimeConnection {
@@ -1396,7 +1459,7 @@ pub mod adapter {
         relay_tx: mpsc::Sender<AdapterFrame>,
     ) -> RuntimeConnection {
         let local_runtime_url = local_runtime_url.to_owned();
-        let (tx, mut rx) = mpsc::channel::<TungsteniteMessage>(super::QUEUE_CAPACITY);
+        let (tx, mut rx) = runtime_channel(RUNTIME_QUEUE_CAPACITY, RUNTIME_QUEUE_BYTE_BUDGET);
         let task = tokio::spawn(async move {
             // A stalled local handshake must not stop relay heartbeat or other clients.
             let runtime = match tokio::time::timeout(
@@ -1423,9 +1486,10 @@ pub mod adapter {
                 loop {
                     tokio::select! {
                         message = rx.recv() => {
-                            let Some(message) = message else { break };
+                            let Some(QueuedRuntimeMessage { message, _byte_permit }) = message else { break };
                             let closing = matches!(message, TungsteniteMessage::Close(_));
                             tokio::time::timeout(super::WRITE_TIMEOUT, writer.send(message)).await??;
+                            drop(_byte_permit);
                             if closing { break; }
                         }
                         message = reader.next() => {
@@ -1646,7 +1710,96 @@ pub mod adapter {
 
     #[cfg(test)]
     mod tests {
-        use super::route_safe_server_id;
+        use super::{
+            route_safe_server_id, runtime_channel, RuntimeConnection, RuntimeSendError,
+            TungsteniteMessage, RUNTIME_QUEUE_BYTE_BUDGET, RUNTIME_QUEUE_CAPACITY,
+        };
+
+        #[test]
+        fn runtime_budget_accepts_a_maximum_size_message() {
+            let (tx, mut rx) = runtime_channel(RUNTIME_QUEUE_CAPACITY, RUNTIME_QUEUE_BYTE_BUDGET);
+            // The real relay's wire limit also includes adapter metadata. Even
+            // this conservative full-size payload must fit the ingress budget.
+            tx.try_send(TungsteniteMessage::Binary(
+                vec![0; super::super::MAX_MESSAGE_SIZE],
+            ))
+            .unwrap();
+            assert_eq!(
+                rx.try_recv().unwrap().message.len(),
+                super::super::MAX_MESSAGE_SIZE
+            );
+            assert_eq!(tx.bytes.available_permits(), RUNTIME_QUEUE_BYTE_BUDGET);
+        }
+
+        #[test]
+        fn runtime_budget_covers_in_flight_messages_and_releases_on_drop() {
+            let (tx, mut rx) = runtime_channel(2, 4);
+            tx.try_send(TungsteniteMessage::Binary(vec![0; 4])).unwrap();
+            let in_flight = rx.try_recv().unwrap();
+            // The count slot is free, but a write still owns all four bytes.
+            assert_eq!(
+                tx.try_send(TungsteniteMessage::Binary(vec![0])),
+                Err(RuntimeSendError::Full)
+            );
+            drop(in_flight);
+            tx.try_send(TungsteniteMessage::Text("\u{00e9}".into()))
+                .unwrap();
+            assert_eq!(
+                tx.bytes.available_permits(),
+                2,
+                "text is charged by UTF-8 bytes"
+            );
+            drop(rx);
+            assert_eq!(tx.bytes.available_permits(), 4);
+            assert_eq!(
+                tx.try_send(TungsteniteMessage::Binary(vec![0])),
+                Err(RuntimeSendError::Closed)
+            );
+        }
+
+        #[test]
+        fn full_runtime_count_queue_returns_its_attempted_byte_permit() {
+            let (tx, mut rx) = runtime_channel(1, 4);
+            tx.try_send(TungsteniteMessage::Binary(Vec::new())).unwrap();
+            assert_eq!(
+                tx.bytes.available_permits(),
+                3,
+                "empty frames cost one byte"
+            );
+            assert_eq!(
+                tx.try_send(TungsteniteMessage::Binary(vec![0; 2])),
+                Err(RuntimeSendError::Full)
+            );
+            assert_eq!(tx.bytes.available_permits(), 3);
+            drop(rx.try_recv().unwrap());
+            assert_eq!(tx.bytes.available_permits(), 4);
+        }
+
+        #[tokio::test]
+        async fn aborting_runtime_releases_queued_and_in_flight_byte_permits() {
+            let (tx, mut rx) = runtime_channel(2, 4);
+            let budget = tx.bytes.clone();
+            tx.try_send(TungsteniteMessage::Binary(vec![0; 2])).unwrap();
+            tx.try_send(TungsteniteMessage::Binary(vec![0; 2])).unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _in_flight = rx.recv().await.unwrap();
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            ready_rx.await.unwrap();
+            assert_eq!(budget.available_permits(), 0);
+            let task_finished = task.abort_handle();
+            drop(RuntimeConnection { tx, task });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !task_finished.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(budget.available_permits(), 4);
+        }
 
         #[test]
         fn route_safe_server_id_rejects_only_unrepresentable_segments() {
